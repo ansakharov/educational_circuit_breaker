@@ -18,105 +18,127 @@ const (
 type CircuitBreaker struct {
 	mu sync.Mutex
 	// CLOSED - work!, OPEN - fail!, HALFOPEN - work until fail!
-	State Status
+	state Status
 	// Длинна отслеживаемого хвоста запросов
-	RecordLength int
+	recordLength int
 	// Сколько времени у CB восстановиться
-	Timeout time.Duration
+	timeout time.Duration
 
-	LastAttemptedAt time.Time
+	lastAttemptedAt time.Time
 	// Процент запросов после которого открывается CB
-	Percentile float64
+	percentile float64
 	// Buffer хранит данные о результатах запроса
-	Buffer []bool
+	buffer []bool
 	// Pos увеличивается для каждого след запроса, потом сбрасывает в 0
-	Pos int
+	pos int
 	// Сколько успешных запросов надо сделать подряд, чтобы перейти в CLOSED
-	RecoveryRequests int
+	recoveryRequests int
 	// Сколько успешных запросов в HALFOPEN уже сделано
-	SuccessCount int
+	successCount int
 }
 
 func NewCircuitBreaker(recordLength int, timeout time.Duration, percentile float64, recoveryRequests int) *CircuitBreaker {
 	return &CircuitBreaker{
-		State:            CLOSED,
-		RecordLength:     recordLength,
-		Timeout:          timeout,
-		Percentile:       percentile,
-		Buffer:           make([]bool, recordLength),
-		Pos:              0,
-		RecoveryRequests: recoveryRequests,
-		SuccessCount:     0,
+		state:            CLOSED,
+		recordLength:     recordLength,
+		timeout:          timeout,
+		percentile:       percentile,
+		buffer:           make([]bool, recordLength),
+		pos:              0,
+		recoveryRequests: recoveryRequests,
+		successCount:     0,
 	}
 }
 
-func (c *CircuitBreaker) Call(service func() error) error {
-	c.mu.Lock()
-	// only OPEN
-	if c.State == OPEN {
-		if elapsed := time.Since(c.LastAttemptedAt); elapsed > c.Timeout {
-			fmt.Printf("\nSWITCHING TO HALFOPEN\n")
-			c.State = HALFOPEN
-			c.SuccessCount = 0
-		} else {
-			c.mu.Unlock()
-			return errors.New("CB IS OPEN")
-		}
-		c.mu.Unlock()
-	} else {
-		c.mu.Unlock()
+func (c *CircuitBreaker) Call(service func() error) (err error) {
+	c.setActualState()
+
+	if c.getState() == OPEN {
+		return errors.New("CB IS OPEN")
 	}
 
-	err := service()
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.Buffer[c.Pos] = err != nil
-	c.Pos = (c.Pos + 1) % c.RecordLength
-	// 0 f, 1 f, 2 t, 3 f, 4 f, 5t, 6t ... 36t
-
-	// only HALFOPEN
-	if c.State == HALFOPEN {
-		if err != nil {
-			fmt.Printf("\nSwitching back to open state due to an error\n")
-
-			c.State = OPEN
-			c.LastAttemptedAt = time.Now()
-			c.SuccessCount = 0 // сбрасываем счетчик успешных запросов
-		} else {
-			c.SuccessCount++
-			if c.SuccessCount > c.RecoveryRequests {
-				fmt.Printf("\nSwitching to closed state\n")
-
-				c.Reset()
-			}
-		}
+	err = service()
+	if err != nil {
+		c.onError()
 		return err
 	}
 
-	// only CLOSED
-	failureCount := 0
-	for _, failed := range c.Buffer {
-		if failed {
-			failureCount++
-		}
-	}
-	if float64(failureCount)/float64(c.RecordLength) >= c.Percentile {
-		fmt.Printf("\nSwitching to open state due to exceeding percentile\n\n")
+	c.onSuccess()
 
-		c.State = OPEN
-		c.LastAttemptedAt = time.Now()
-	}
-
-	return err
+	return nil
 }
 
-func (c *CircuitBreaker) Reset() {
-	c.State = CLOSED
-	c.Buffer = make([]bool, c.RecordLength) // сбрасываем буфер
-	c.Pos = 0                               // сбрасываем позицию
-	c.SuccessCount = 0                      // сбрасываем счетчик успешных запросов
+func (c *CircuitBreaker) getState() Status {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state
+}
+
+func (c *CircuitBreaker) setActualState() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	switch c.state {
+	case OPEN:
+		if elapsed := time.Since(c.lastAttemptedAt); elapsed > c.timeout {
+			fmt.Printf("\nSwitching to HALFOPEN state\n")
+			c.state = HALFOPEN
+		}
+
+	case HALFOPEN:
+		if c.successCount > c.recoveryRequests {
+			fmt.Printf("\nSwitching to CLOSED state\n")
+
+			c.state = CLOSED
+			c.buffer = make([]bool, c.recordLength) // сбрасываем буфер
+			c.pos = 0                               // сбрасываем позицию
+			c.successCount = 0                      // сбрасываем счетчик успешных запросов
+		}
+	case CLOSED:
+		failureCount := 0
+
+		for _, failed := range c.buffer {
+			if failed {
+				failureCount++
+			}
+		}
+
+		if float64(failureCount)/float64(c.recordLength) >= c.percentile {
+			fmt.Printf("\nSwitching to OPEN state due to exceeding percentile\n\n")
+
+			c.state = OPEN
+			c.lastAttemptedAt = time.Now()
+		}
+	}
+}
+
+func (c *CircuitBreaker) onSuccess() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.buffer[c.pos] = false
+	c.pos = (c.pos + 1) % c.recordLength
+
+	if c.state == HALFOPEN {
+		c.successCount++
+	}
+}
+
+func (c *CircuitBreaker) onError() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.buffer[c.pos] = true
+	c.pos = (c.pos + 1) % c.recordLength
+
+	if c.state == HALFOPEN {
+		fmt.Printf("\nSwitching to OPEN state\n")
+		c.state = OPEN
+		c.successCount = 0
+	}
+
+	c.lastAttemptedAt = time.Now()
+	c.successCount = 0
 }
 
 func main() {
